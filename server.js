@@ -168,27 +168,40 @@ app.post('/api/generate-diet', dietLimiter, async (req, res) => {
     // Gerar PDF
     const pdfInfo = await pdfService.generatePDF(generatedPlan, userData);
     
-    // Salvar no Firebase usando o novo service
-    if (db) {
-      try {
-        await db.collection('dietPlans').add({
-          userId: userData.userId || 'anonymous-' + Date.now(),
-          userData,
-          dietPlan: generatedPlan.content,
-          pdfInfo,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-        console.log('💾 Plano salvo no Firebase');
-        
-        // Se for usuário autenticado, incrementar uso
-        if (userData.userId && firebaseUserService && typeof firebaseUserService.incrementPlanUsage === 'function') {
-          await firebaseUserService.incrementPlanUsage(userData.userId);
-          console.log('📊 Uso incrementado para usuário:', userData.userId);
-        }
-      } catch (saveError) {
-        console.log('⚠️ Erro ao salvar no Firebase:', saveError.message);
+    // Salvar no Firebase - OBRIGATÓRIO
+    if (!db) {
+      console.error('❌ Firebase não configurado - não é possível salvar dados');
+      return res.status(500).json({
+        success: false,
+        error: 'Sistema de armazenamento não disponível. Configure o Firebase.'
+      });
+    }
+
+    try {
+      const dietPlanData = {
+        userId: userData.userId || 'anonymous-' + Date.now(),
+        userData,
+        dietPlan: generatedPlan.content,
+        pdfInfo,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      };
+
+      const docRef = await db.collection('dietPlans').add(dietPlanData);
+      console.log('💾 Plano salvo no Firebase com ID:', docRef.id);
+
+      // Se for usuário autenticado, incrementar uso
+      if (userData.userId && firebaseUserService && typeof firebaseUserService.incrementPlanUsage === 'function') {
+        await firebaseUserService.incrementPlanUsage(userData.userId);
+        console.log('📊 Uso incrementado para usuário:', userData.userId);
       }
+    } catch (saveError) {
+      console.error('❌ ERRO CRÍTICO ao salvar no Firebase:', saveError);
+      return res.status(500).json({
+        success: false,
+        error: 'Erro ao salvar plano no banco de dados',
+        details: process.env.NODE_ENV === 'development' ? saveError.message : 'Entre em contato com o suporte'
+      });
     }
     
     console.log('✅ Dieta gerada com sucesso!');
@@ -256,30 +269,44 @@ app.post('/api/process-payment', async (req, res) => {
     const generatedPlan = await aiService.generatePlan(userData);
     const pdfInfo = await pdfService.generatePDF(generatedPlan, userData);
     
-    // Salvar transação no Firebase
-    if (db) {
-      try {
-        const transactionData = {
-          userId: userData.userId || 'anonymous-' + Date.now(),
-          planType,
-          userData,
-          dietPlan: generatedPlan.content,
-          pdfInfo,
-          paymentStatus: 'approved',
-          amount: getPlanPrice(planType),
-          createdAt: admin.firestore.FieldValue.serverTimestamp()
-        };
-        
-        await db.collection('transactions').add(transactionData);
-        console.log('💾 Transação salva no Firebase');
-        
-        // Se for usuário autenticado, incrementar uso
-        if (userData.userId && firebaseUserService && typeof firebaseUserService.incrementPlanUsage === 'function') {
-          await firebaseUserService.incrementPlanUsage(userData.userId);
-        }
-      } catch (saveError) {
-        console.log('⚠️ Erro ao salvar transação:', saveError.message);
+    // Salvar transação no Firebase - OBRIGATÓRIO
+    if (!db) {
+      console.error('❌ Firebase não configurado - não é possível salvar transação');
+      return res.status(500).json({
+        success: false,
+        paymentApproved: false,
+        error: 'Sistema de armazenamento não disponível. Configure o Firebase.'
+      });
+    }
+
+    try {
+      const transactionData = {
+        userId: userData.userId || 'anonymous-' + Date.now(),
+        planType,
+        userData,
+        dietPlan: generatedPlan.content,
+        pdfInfo,
+        paymentStatus: 'approved',
+        amount: getPlanPrice(planType),
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      };
+
+      const transactionRef = await db.collection('transactions').add(transactionData);
+      console.log('💾 Transação salva no Firebase com ID:', transactionRef.id);
+
+      // Se for usuário autenticado, incrementar uso
+      if (userData.userId && firebaseUserService && typeof firebaseUserService.incrementPlanUsage === 'function') {
+        await firebaseUserService.incrementPlanUsage(userData.userId);
+        console.log('📊 Uso incrementado para usuário:', userData.userId);
       }
+    } catch (saveError) {
+      console.error('❌ ERRO CRÍTICO ao salvar transação no Firebase:', saveError);
+      return res.status(500).json({
+        success: false,
+        paymentApproved: false,
+        error: 'Erro ao salvar transação no banco de dados',
+        details: process.env.NODE_ENV === 'development' ? saveError.message : 'Entre em contato com o suporte'
+      });
     }
     
     res.json({
@@ -312,28 +339,30 @@ app.post('/api/process-payment', async (req, res) => {
 app.get('/api/my-diets', async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
-    
+
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return res.status(401).json({
         success: false,
         error: 'Token de autenticação necessário'
       });
     }
-    
+
     const token = authHeader.split(' ')[1];
-    
+
     // Verificar token Firebase
     const decodedToken = await admin.auth().verifyIdToken(token);
     const userId = decodedToken.uid;
-    
+
     if (!db) {
-      return res.json({
-        success: true,
-        message: 'Firebase não configurado',
+      console.error('❌ Firebase não configurado - não é possível buscar dietas');
+      return res.status(500).json({
+        success: false,
+        error: 'Sistema de armazenamento não disponível. Configure o Firebase.',
         data: []
       });
     }
 
+    console.log('📖 Buscando dietas do usuário:', userId);
     const snapshot = await db.collection('dietPlans')
       .where('userId', '==', userId)
       .orderBy('createdAt', 'desc')
@@ -352,6 +381,7 @@ app.get('/api/my-diets', async (req, res) => {
       });
     });
 
+    console.log(`✅ Encontradas ${diets.length} dietas para o usuário ${userId}`);
     res.json({
       success: true,
       data: diets,
@@ -362,7 +392,8 @@ app.get('/api/my-diets', async (req, res) => {
     console.error('❌ Erro ao buscar dietas do usuário:', error);
     res.status(500).json({
       success: false,
-      error: 'Erro ao buscar suas dietas'
+      error: 'Erro ao buscar suas dietas',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
@@ -581,20 +612,46 @@ process.on('SIGTERM', () => {
   });
 });
 
-// Log de inicialização dos serviços
+// Log de inicialização dos serviços e teste de conectividade
 setTimeout(async () => {
   console.log('🔧 Verificando configurações...');
   console.log(`   OpenAI: ${process.env.OPENAI_API_KEY ? '✅ Configurado' : '❌ Não configurado'}`);
   console.log(`   Anthropic: ${process.env.ANTHROPIC_API_KEY ? '✅ Configurado' : '❌ Não configurado'}`);
-  console.log(`   Firebase: ${db ? '✅ Conectado' : '❌ Não configurado'}`);
   console.log(`   Firebase User Service: ${firebaseUserService ? '✅ Disponível' : '❌ Não disponível'}`);
   console.log(`   AI Service: ${aiService && typeof aiService.generatePlan === 'function' ? '✅ Funcionando' : '❌ Com problemas'}`);
-  
+
+  // Testar conexão com Firebase
+  if (db) {
+    try {
+      console.log('   Firebase: Testando conexão...');
+      const testDoc = db.collection('_system').doc('health');
+      await testDoc.set({
+        lastCheck: admin.firestore.FieldValue.serverTimestamp(),
+        status: 'healthy',
+        serverStarted: new Date().toISOString()
+      });
+      console.log('   Firebase: ✅ Conectado e persistindo dados corretamente!');
+
+      // Verificar se consegue ler de volta
+      const doc = await testDoc.get();
+      if (doc.exists) {
+        console.log('   Firebase: ✅ Leitura confirmada');
+      }
+    } catch (error) {
+      console.error('   Firebase: ❌ ERRO na conexão:', error.message);
+      console.error('   ⚠️ CRÍTICO: Dados NÃO serão persistidos!');
+    }
+  } else {
+    console.log('   Firebase: ❌ Não configurado');
+    console.error('   ⚠️ CRÍTICO: Dados serão armazenados apenas em memória!');
+  }
+
+  console.log('');
   if (!process.env.OPENAI_API_KEY && !process.env.ANTHROPIC_API_KEY) {
     console.log('⚠️ ATENÇÃO: Configure pelo menos uma chave de IA no .env');
   }
   if (!db) {
-    console.log('⚠️ ATENÇÃO: Configure Firebase para salvar dados');
+    console.log('⚠️ CRÍTICO: Configure Firebase para persistir dados. Veja: config/firebase.js');
   }
   if (!aiService || typeof aiService.generatePlan !== 'function') {
     console.log('⚠️ ATENÇÃO: aiService não está funcionando corretamente');
