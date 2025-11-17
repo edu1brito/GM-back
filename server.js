@@ -90,17 +90,9 @@ app.use(compression());
 app.use(morgan('combined'));
 app.use(limiter);
 app.use(cors({
-  origin: process.env.FRONTEND_URL ? 
-    process.env.FRONTEND_URL.split(',') : 
-    [
-      'http://localhost:3000', 
-      'http://127.0.0.1:5500', 
-      'http://localhost:5500', 
-      'http://localhost:8000',
-    'http://127.0.0.1:5501',  // ← ADICIONE ESTA
-    'http://localhost:5501', 
-      
-    ],
+  origin: process.env.FRONTEND_URL ?
+    process.env.FRONTEND_URL.split(',') :
+    (process.env.NODE_ENV === 'production' ? false : true), // Permite tudo em dev, restringe em prod
   credentials: true
 }));
 app.use(express.json({ limit: '10mb' }));
