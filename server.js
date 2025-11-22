@@ -97,14 +97,18 @@ app.use(cors({
       'http://127.0.0.1:5500', 
       'http://localhost:5500', 
       'http://localhost:8000',
-    'http://127.0.0.1:5501',  // ← ADICIONE ESTA
-    'http://localhost:5501', 
-      
+      'http://127.0.0.1:5501',
+      'http://localhost:5501'
     ],
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  exposedHeaders: ['Content-Length', 'X-JSON'],
+  maxAge: 86400 // 24 horas
 }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
+
 
 // Servir arquivos estáticos (PDFs)
 app.use('/api/files', express.static(path.join(__dirname, 'uploads')));
@@ -601,5 +605,6 @@ setTimeout(async () => {
   }
   console.log('');
 }, 1000);
+
 
 module.exports = app;
