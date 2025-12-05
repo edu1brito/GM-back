@@ -1,76 +1,68 @@
-const jwt = require('jsonwebtoken');
-const User = require('../services/firebaseUserService');
+const { admin } = require('../config/firebase');
+const { firebaseUserService } = require('../services/firebaseUserService');
 
-// MIDDLEWARE DE AUTENTICAÇÃO PRINCIPAL
+// MIDDLEWARE DE AUTENTICAÇÃO USANDO FIREBASE
 const auth = async (req, res, next) => {
   try {
-    let token;
-    
-    // 1. VERIFICAR SE O TOKEN EXISTS NO HEADER
-    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
-      token = req.headers.authorization.split(' ')[1];
+    let idToken;
+
+    // 1. EXTRAIR TOKEN DO HEADER
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+      idToken = req.headers.authorization.split(' ')[1];
     }
-    // ✅ ADICIONEI: Também verificar em cookies (caso use)
-    else if (req.cookies && req.cookies.jwt) {
-      token = req.cookies.jwt;
-    }
-    
-    if (!token) {
+
+    if (!idToken) {
       return res.status(401).json({
         success: false,
         message: 'Acesso negado. Token não fornecido.',
         code: 'NO_TOKEN'
       });
     }
-    
-    // 2. VERIFICAR SE O TOKEN É VÁLIDO
-    let decoded;
+
+    // 2. VERIFICAR TOKEN COM FIREBASE
+    let decodedToken;
     try {
-      decoded = jwt.verify(token, process.env.JWT_SECRET);
-    } catch (jwtError) {
-      // ✅ MELHOREI: Tratamento específico de cada tipo de erro JWT
-      if (jwtError.name === 'TokenExpiredError') {
+      decodedToken = await admin.auth().verifyIdToken(idToken);
+    } catch (firebaseError) {
+      console.error('Erro ao verificar token Firebase:', firebaseError.code);
+
+      if (firebaseError.code === 'auth/id-token-expired') {
         return res.status(401).json({
           success: false,
           message: 'Token expirado. Faça login novamente.',
           code: 'TOKEN_EXPIRED'
         });
       }
-      
-      if (jwtError.name === 'JsonWebTokenError') {
+
+      if (firebaseError.code === 'auth/argument-error') {
         return res.status(401).json({
           success: false,
-          message: 'Token malformado.',
+          message: 'Token inválido ou malformado.',
           code: 'INVALID_TOKEN'
         });
       }
-      
-      if (jwtError.name === 'NotBeforeError') {
-        return res.status(401).json({
-          success: false,
-          message: 'Token ainda não é válido.',
-          code: 'TOKEN_NOT_ACTIVE'
-        });
-      }
-      
+
       return res.status(401).json({
         success: false,
         message: 'Token inválido.',
-        code: 'TOKEN_ERROR'
+        code: 'TOKEN_ERROR',
+        details: firebaseError.message
       });
     }
-    
-    // 3. VERIFICAR SE O USUÁRIO AINDA EXISTE
-    const user = await User.findById(decoded.id).select('-password');
+
+    // 3. BUSCAR DADOS DO USUÁRIO NO FIRESTORE
+    const uid = decodedToken.uid;
+    const user = await firebaseUserService.getUserById(uid);
+
     if (!user) {
       return res.status(401).json({
         success: false,
-        message: 'Usuário não encontrado. Token pode ter sido comprometido.',
+        message: 'Usuário não encontrado.',
         code: 'USER_NOT_FOUND'
       });
     }
-    
-    // 4. VERIFICAR SE O USUÁRIO ESTÁ ATIVO
+
+    // 4. VERIFICAR SE USUÁRIO ESTÁ ATIVO
     if (!user.isActive) {
       return res.status(401).json({
         success: false,
@@ -78,9 +70,9 @@ const auth = async (req, res, next) => {
         code: 'ACCOUNT_DISABLED'
       });
     }
-    
-    // ✅ ADICIONEI: Verificar se a conta está bloqueada por tentativas de login
-    if (user.isLocked && user.isLocked()) {
+
+    // 5. VERIFICAR SE CONTA ESTÁ BLOQUEADA
+    if (firebaseUserService.isAccountLocked(user)) {
       return res.status(423).json({
         success: false,
         message: 'Conta temporariamente bloqueada por tentativas de login inválidas.',
@@ -88,19 +80,14 @@ const auth = async (req, res, next) => {
         lockUntil: user.security?.lockUntil
       });
     }
-    
-    // ✅ ADICIONEI: Verificar se a assinatura ainda está válida (para endpoints premium)
-    if (user.subscription.status === 'expired') {
-      // Não bloquear, mas adicionar informação
-      user._subscriptionExpired = true;
-    }
-    
-    // 5. TUDO OK! Adicionar usuário ao request
+
+    // 6. ADICIONAR INFORMAÇÕES AO REQUEST
     req.user = user;
-    req.token = token; // ✅ ADICIONEI: Também salvar o token para possível uso
-    
+    req.uid = uid;
+    req.token = idToken;
+
     next();
-    
+
   } catch (error) {
     console.error('Erro na autenticação:', error);
     return res.status(500).json({
@@ -111,50 +98,45 @@ const auth = async (req, res, next) => {
   }
 };
 
-// ✅ ADICIONEI: MIDDLEWARE OPCIONAL - Só pega o usuário SE tiver token, mas não bloqueia
+// MIDDLEWARE OPCIONAL - Só pega o usuário SE tiver token, mas não bloqueia
 const optionalAuth = async (req, res, next) => {
   try {
-    let token;
-    
-    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
-      token = req.headers.authorization.split(' ')[1];
-    } else if (req.cookies && req.cookies.jwt) {
-      token = req.cookies.jwt;
+    let idToken;
+
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+      idToken = req.headers.authorization.split(' ')[1];
     }
-    
-    if (token) {
+
+    if (idToken) {
       try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const user = await User.findById(decoded.id).select('-password');
-        
-        if (user && user.isActive && (!user.isLocked || !user.isLocked())) {
+        const decodedToken = await admin.auth().verifyIdToken(idToken);
+        const user = await firebaseUserService.getUserById(decodedToken.uid);
+
+        if (user && user.isActive && !firebaseUserService.isAccountLocked(user)) {
           req.user = user;
-          req.token = token;
+          req.uid = decodedToken.uid;
+          req.token = idToken;
         }
       } catch (error) {
-        // Token inválido, mas não bloqueia - apenas ignora
         console.log('Token inválido no optionalAuth:', error.message);
       }
     }
-    
-    // Sempre prossegue, mesmo sem token válido
+
     next();
-    
+
   } catch (error) {
     console.error('Erro no optionalAuth:', error);
-    next(); // Mesmo com erro, não bloqueia
+    next();
   }
 };
 
-// ✅ ADICIONEI: MIDDLEWARE PARA VERIFICAR PLANOS ESPECÍFICOS
+// MIDDLEWARE PARA VERIFICAR PLANOS ESPECÍFICOS
 const requirePlan = (requiredPlans) => {
-  // Validar entrada
   if (!Array.isArray(requiredPlans)) {
     requiredPlans = [requiredPlans];
   }
-  
+
   return (req, res, next) => {
-    // Primeiro verificar se está autenticado
     if (!req.user) {
       return res.status(401).json({
         success: false,
@@ -162,38 +144,35 @@ const requirePlan = (requiredPlans) => {
         code: 'AUTH_REQUIRED'
       });
     }
-    
-    // Verificar se tem o plano necessário
-    if (!requiredPlans.includes(req.user.subscription.plan)) {
+
+    if (!requiredPlans.includes(req.user.subscription?.plan)) {
       return res.status(403).json({
         success: false,
         message: `Esta funcionalidade requer plano: ${requiredPlans.join(' ou ')}`,
-        currentPlan: req.user.subscription.plan,
+        currentPlan: req.user.subscription?.plan,
         requiredPlans,
         code: 'PLAN_REQUIRED',
-        upgradeUrl: '/plans' // URL para upgrade
+        upgradeUrl: '/plans'
       });
     }
-    
-    // Verificar se a assinatura está ativa
-    if (req.user.subscription.status !== 'active') {
+
+    if (req.user.subscription?.status !== 'active') {
       return res.status(403).json({
         success: false,
         message: 'Assinatura inativa. Renove seu plano para continuar.',
-        currentStatus: req.user.subscription.status,
+        currentStatus: req.user.subscription?.status,
         code: 'SUBSCRIPTION_INACTIVE',
         renewUrl: '/plans'
       });
     }
-    
+
     next();
   };
 };
 
-// ✅ ADICIONEI: MIDDLEWARE PARA VERIFICAR SE PODE GERAR PLANOS
+// MIDDLEWARE PARA VERIFICAR SE PODE GERAR PLANOS
 const canGeneratePlan = async (req, res, next) => {
   try {
-    // Verificar se está autenticado
     if (!req.user) {
       return res.status(401).json({
         success: false,
@@ -201,10 +180,9 @@ const canGeneratePlan = async (req, res, next) => {
         code: 'AUTH_REQUIRED'
       });
     }
-    
-    // Verificar se pode gerar plano
-    const canGenerate = req.user.canGeneratePlan();
-    
+
+    const canGenerate = firebaseUserService.canGeneratePlan(req.user);
+
     if (!canGenerate.canGenerate) {
       return res.status(403).json({
         success: false,
@@ -214,11 +192,10 @@ const canGeneratePlan = async (req, res, next) => {
         upgradeUrl: '/plans'
       });
     }
-    
-    // Adicionar informações de limite ao request
+
     req.planLimits = canGenerate;
     next();
-    
+
   } catch (error) {
     console.error('Erro ao verificar limite de planos:', error);
     return res.status(500).json({
@@ -229,7 +206,7 @@ const canGeneratePlan = async (req, res, next) => {
   }
 };
 
-// ✅ ADICIONEI: MIDDLEWARE PARA VERIFICAR PROPRIEDADE (usuário só acessa seus próprios dados)
+// MIDDLEWARE PARA VERIFICAR PROPRIEDADE
 const checkOwnership = (resourceIdField = 'id') => {
   return (req, res, next) => {
     if (!req.user) {
@@ -239,11 +216,10 @@ const checkOwnership = (resourceIdField = 'id') => {
         code: 'AUTH_REQUIRED'
       });
     }
-    
+
     const resourceId = req.params[resourceIdField];
-    const userId = req.user.id || req.user._id;
-    
-    // Para alguns recursos, verificar se o usuário é dono
+    const userId = req.user.id || req.uid;
+
     if (resourceId && resourceId.toString() !== userId.toString()) {
       return res.status(403).json({
         success: false,
@@ -251,12 +227,12 @@ const checkOwnership = (resourceIdField = 'id') => {
         code: 'ACCESS_DENIED'
       });
     }
-    
+
     next();
   };
 };
 
-// ✅ ADICIONEI: MIDDLEWARE PARA VERIFICAR ROLE DE ADMIN (para futuras funcionalidades)
+// MIDDLEWARE PARA VERIFICAR ROLE DE ADMIN
 const requireAdmin = (req, res, next) => {
   if (!req.user) {
     return res.status(401).json({
@@ -265,7 +241,7 @@ const requireAdmin = (req, res, next) => {
       code: 'AUTH_REQUIRED'
     });
   }
-  
+
   if (!req.user.isAdmin) {
     return res.status(403).json({
       success: false,
@@ -273,46 +249,8 @@ const requireAdmin = (req, res, next) => {
       code: 'ADMIN_REQUIRED'
     });
   }
-  
-  next();
-};
 
-// ✅ ADICIONEI: MIDDLEWARE PARA RATE LIMITING POR USUÁRIO
-const userRateLimit = (maxRequests = 100, windowMs = 60 * 1000) => {
-  const userRequests = new Map();
-  
-  return (req, res, next) => {
-    if (!req.user) {
-      return next(); // Se não está autenticado, deixa o rate limit global cuidar
-    }
-    
-    const userId = req.user.id.toString();
-    const now = Date.now();
-    const windowStart = now - windowMs;
-    
-    // Limpar requests antigos
-    if (userRequests.has(userId)) {
-      const requests = userRequests.get(userId);
-      userRequests.set(userId, requests.filter(time => time > windowStart));
-    }
-    
-    const currentRequests = userRequests.get(userId) || [];
-    
-    if (currentRequests.length >= maxRequests) {
-      return res.status(429).json({
-        success: false,
-        message: `Muitas requisições. Máximo ${maxRequests} por minuto.`,
-        code: 'USER_RATE_LIMIT',
-        retryAfter: Math.ceil(windowMs / 1000)
-      });
-    }
-    
-    // Adicionar nova request
-    currentRequests.push(now);
-    userRequests.set(userId, currentRequests);
-    
-    next();
-  };
+  next();
 };
 
 module.exports = {
@@ -321,6 +259,5 @@ module.exports = {
   requirePlan,
   canGeneratePlan,
   checkOwnership,
-  requireAdmin,
-  userRateLimit
+  requireAdmin
 };

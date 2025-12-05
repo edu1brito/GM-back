@@ -5,6 +5,8 @@ const { body, validationResult } = require('express-validator');
 const { firebaseUserService } = require('../services/firebaseUserService');
 const { auth, optionalAuth } = require('../middleware/firebaseAuth');
 
+// Node 18+ já tem fetch nativo - não precisa de importação adicional
+
 const router = express.Router();
 
 // UTILITÁRIOS FIREBASE
@@ -106,14 +108,34 @@ router.post('/register', [
         password,
         disabled: false
       });
-      
-      // Criar custom token
-      const customToken = await createCustomToken(inactiveUser.id);
-      
+
+      // Fazer login para obter idToken
+      const authResult = await verifyFirebaseCredentials(email, password);
+
+      if (!authResult.success) {
+        // Caso falhe, retornar custom token como fallback
+        const customToken = await createCustomToken(inactiveUser.id);
+        return res.status(201).json({
+          success: true,
+          message: 'Conta reativada com sucesso! Bem-vindo de volta! 🎉',
+          customToken,
+          user: {
+            id: updatedUser.id,
+            name: updatedUser.name,
+            email: updatedUser.email,
+            subscription: updatedUser.subscription,
+            createdAt: updatedUser.createdAt,
+            emailVerified: updatedUser.security?.emailVerified || false
+          }
+        });
+      }
+
       return res.status(201).json({
         success: true,
         message: 'Conta reativada com sucesso! Bem-vindo de volta! 🎉',
-        customToken,
+        idToken: authResult.idToken,
+        refreshToken: authResult.refreshToken,
+        expiresIn: authResult.expiresIn,
         user: {
           id: updatedUser.id,
           name: updatedUser.name,
@@ -181,14 +203,34 @@ router.post('/register', [
     };
     
     await firebaseUserService.createUser(firebaseUser.uid, userData);
-    
-    // Criar custom token
-    const customToken = await createCustomToken(firebaseUser.uid);
-    
+
+    // Fazer login para obter idToken
+    const authResult = await verifyFirebaseCredentials(email, password);
+
+    if (!authResult.success) {
+      // Caso falhe, retornar custom token como fallback
+      const customToken = await createCustomToken(firebaseUser.uid);
+      return res.status(201).json({
+        success: true,
+        message: 'Usuário criado com sucesso! Bem-vindo ao GymMind! 🎉',
+        customToken,
+        user: {
+          id: firebaseUser.uid,
+          name: userData.name,
+          email: userData.email,
+          subscription: userData.subscription,
+          createdAt: userData.createdAt,
+          emailVerified: userData.security.emailVerified
+        }
+      });
+    }
+
     res.status(201).json({
       success: true,
       message: 'Usuário criado com sucesso! Bem-vindo ao GymMind! 🎉',
-      customToken,
+      idToken: authResult.idToken,
+      refreshToken: authResult.refreshToken,
+      expiresIn: authResult.expiresIn,
       user: {
         id: firebaseUser.uid,
         name: userData.name,
@@ -227,6 +269,49 @@ router.post('/register', [
   }
 });
 
+// Helper para verificar credenciais usando Firebase Auth REST API
+async function verifyFirebaseCredentials(email, password) {
+  const FIREBASE_API_KEY = process.env.FIREBASE_WEB_API_KEY;
+
+  if (!FIREBASE_API_KEY) {
+    throw new Error('FIREBASE_WEB_API_KEY não configurada');
+  }
+
+  try {
+    const response = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email,
+          password,
+          returnSecureToken: true
+        })
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.error?.message || 'Credenciais inválidas');
+    }
+
+    return {
+      success: true,
+      idToken: data.idToken,
+      refreshToken: data.refreshToken,
+      expiresIn: data.expiresIn
+    };
+  } catch (error) {
+    console.error('Erro ao verificar credenciais:', error.message);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+
 // @desc    Login usuário
 // @route   POST /api/auth/login
 // @access  Public
@@ -235,16 +320,16 @@ router.post('/login', [
     .isEmail()
     .withMessage('Email inválido')
     .normalizeEmail(),
-  
+
   body('password')
     .notEmpty()
     .withMessage('Senha é obrigatória'),
-    
+
   body('rememberMe')
     .optional()
     .isBoolean()
     .withMessage('Lembrar de mim deve ser true ou false')
-    
+
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -256,12 +341,12 @@ router.post('/login', [
         code: 'VALIDATION_ERROR'
       });
     }
-    
+
     const { email, password, rememberMe = false } = req.body;
-    
+
     // Buscar usuário no Firestore
     const user = await firebaseUserService.getUserByEmail(email);
-    
+
     if (!user || !user.isActive) {
       return res.status(401).json({
         success: false,
@@ -269,26 +354,50 @@ router.post('/login', [
         code: 'INVALID_CREDENTIALS'
       });
     }
-    
+
     // Verificar se conta está bloqueada
-    if (user.security?.lockUntil && new Date() < user.security.lockUntil.toDate()) {
-      return res.status(423).json({
+    if (user.security?.lockUntil) {
+      const lockUntil = user.security.lockUntil.toDate ? user.security.lockUntil.toDate() : new Date(user.security.lockUntil);
+      if (new Date() < lockUntil) {
+        return res.status(423).json({
+          success: false,
+          message: 'Conta temporariamente bloqueada por tentativas de login inválidas.',
+          code: 'ACCOUNT_LOCKED',
+          lockUntil: lockUntil
+        });
+      }
+    }
+
+    // Verificar credenciais no Firebase Auth usando REST API
+    const authResult = await verifyFirebaseCredentials(email, password);
+
+    if (!authResult.success) {
+      // Incrementar tentativas de login
+      const loginAttempts = (user.security?.loginAttempts || 0) + 1;
+      const maxAttempts = 5;
+
+      let updateData = {
+        'security.loginAttempts': loginAttempts
+      };
+
+      // Bloquear conta após muitas tentativas
+      if (loginAttempts >= maxAttempts) {
+        updateData['security.lockUntil'] = new Date(Date.now() + 30 * 60 * 1000); // 30 minutos
+      }
+
+      await firebaseUserService.updateUser(user.id, updateData);
+
+      return res.status(401).json({
         success: false,
-        message: 'Conta temporariamente bloqueada por tentativas de login inválidas.',
-        code: 'ACCOUNT_LOCKED',
-        lockUntil: user.security.lockUntil
+        message: 'Email ou senha incorretos',
+        code: 'INVALID_CREDENTIALS'
       });
     }
-    
-    // Verificar credenciais no Firebase Auth
+
+    // Verificar se usuário está desabilitado no Firebase Auth
     try {
-      // Firebase Admin SDK não tem método direto para verificar senha
-      // Precisamos usar o Firebase Auth REST API ou fazer o login no client-side
-      // Por enquanto, vamos assumir que o login será feito no frontend
-      
-      // Buscar usuário no Firebase Auth para verificar se existe e está ativo
       const firebaseUser = await admin.auth().getUserByEmail(email);
-      
+
       if (firebaseUser.disabled) {
         return res.status(401).json({
           success: false,
@@ -296,55 +405,35 @@ router.post('/login', [
           code: 'ACCOUNT_DISABLED'
         });
       }
-      
-      // Reset tentativas de login em caso de sucesso
-      await firebaseUserService.updateUser(user.id, {
-        'security.loginAttempts': 0,
-        'security.lockUntil': null,
-        lastLogin: new Date()
-      });
-      
-      // Criar custom token
-      const customToken = await createCustomToken(user.id);
-      
-      res.json({
-        success: true,
-        message: 'Login realizado com sucesso! Bem-vindo de volta! 🚀',
-        customToken,
-        user: {
-          id: user.id,
-          name: user.name,
-          email: user.email,
-          subscription: user.subscription,
-          usage: user.usage,
-          lastLogin: user.lastLogin,
-          emailVerified: user.security?.emailVerified || false
-        }
-      });
-      
-    } catch (firebaseError) {
-      // Incrementar tentativas de login
-      const loginAttempts = (user.security?.loginAttempts || 0) + 1;
-      const maxAttempts = 5;
-      
-      let updateData = {
-        'security.loginAttempts': loginAttempts
-      };
-      
-      // Bloquear conta após muitas tentativas
-      if (loginAttempts >= maxAttempts) {
-        updateData['security.lockUntil'] = new Date(Date.now() + 30 * 60 * 1000); // 30 minutos
-      }
-      
-      await firebaseUserService.updateUser(user.id, updateData);
-      
-      return res.status(401).json({
-        success: false,
-        message: 'Email ou senha incorretos',
-        code: 'INVALID_CREDENTIALS'
-      });
+    } catch (error) {
+      console.error('Erro ao verificar usuário no Firebase Auth:', error);
     }
-    
+
+    // Reset tentativas de login em caso de sucesso
+    await firebaseUserService.updateUser(user.id, {
+      'security.loginAttempts': 0,
+      'security.lockUntil': null,
+      lastLogin: new Date()
+    });
+
+    // Retornar o ID token do Firebase diretamente
+    res.json({
+      success: true,
+      message: 'Login realizado com sucesso! Bem-vindo de volta! 🚀',
+      idToken: authResult.idToken,
+      refreshToken: authResult.refreshToken,
+      expiresIn: authResult.expiresIn,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        subscription: user.subscription,
+        usage: user.usage,
+        lastLogin: new Date(),
+        emailVerified: user.security?.emailVerified || false
+      }
+    });
+
   } catch (error) {
     console.error('Erro no login:', error);
     res.status(500).json({
